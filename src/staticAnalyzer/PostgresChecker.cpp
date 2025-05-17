@@ -191,7 +191,7 @@ void PostgresChecker::HandleUseAfterFree(CheckerContext &C, SourceRange Range,
   void PostgresChecker::HandleDoubleFree(CheckerContext &C, SourceRange Range, bool Released,
                         SymbolRef Sym, SymbolRef PrevSym, Category Cat) const{
 
-    llvm::outs() << "!!!!!!!USE AFTER FREE!!!!!!!\n";
+    llvm::outs() << "!!!!!!!USE AFTER EASTER EGG!!!!!!!\n";
   BugType *BT;
   std::string message;
   switch(Cat){
