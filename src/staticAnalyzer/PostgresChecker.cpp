@@ -162,7 +162,6 @@ llvm::StringMap<std::string> ArbitraryMap{
 void PostgresChecker::HandleUseAfterFree(CheckerContext &C, SourceRange Range,
                           SymbolRef Sym, Category Cat) const{
 
-  llvm::outs() << "!!!!!!!USE AFTER FREE!!!!!!!\n";
   BugType *BT;
   std::string message;
   switch(Cat){
@@ -191,7 +190,6 @@ void PostgresChecker::HandleUseAfterFree(CheckerContext &C, SourceRange Range,
   void PostgresChecker::HandleDoubleFree(CheckerContext &C, SourceRange Range, bool Released,
                         SymbolRef Sym, SymbolRef PrevSym, Category Cat) const{
 
-    llvm::outs() << "!!!!!!!USE AFTER EASTER EGG!!!!!!!\n";
   BugType *BT;
   std::string message;
   switch(Cat){
@@ -224,7 +222,6 @@ void PostgresChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) con
   if (!FD)
     return;
 
-  llvm::errs() << Call.getCalleeIdentifier()->getName() << "\n";
   if (FD->getNameAsString() == "pfree")
     return;
 
@@ -369,8 +366,6 @@ void PostgresChecker::HandleFree(const CallEvent &Call, CheckerContext &C, Categ
     }
   }
 
-  llvm::outs() << "FREEING " << SymBase << "\n";
-  
   State = State->set<RegionState>(SymBase, RefState::getReleased(ParentExpr));
 
   C.addTransition(State);
@@ -430,7 +425,6 @@ static bool isReleased(SymbolRef Sym, CheckerContext &C) {
   const RefState *RS = C.getState()->get<RegionState>(Sym);
   if (!RS)
     return false;
-    llvm::outs() << "RefState exists: " << (RS ? "1" : "0") << "\n";
   return (RS && RS->isReleased());
 }
 
@@ -443,13 +437,9 @@ void PostgresChecker::checkLocation(SVal l, bool isLoad, const Stmt *S,
     if (MR){
       if (const VarRegion *VR = dyn_cast<VarRegion>(MR->getBaseRegion())){
         const VarDecl *VD = VR->getDecl();
-        if (VD){
-          llvm::outs() << "CHECKING LOCATION FOR " << VD->getName() << ", IS LOAD: " << (isLoad ? "1" : "0") << "\n";
-      }
       const SymbolicRegion *SrBase = dyn_cast<SymbolicRegion>(MR->getBaseRegion());
       if (SrBase){
          SymbolRef SymBase = SrBase->getSymbol();
-         llvm::outs() << "FOUND SYMBASE: " << SymBase << "\n";
 
       }
   }
@@ -457,7 +447,6 @@ void PostgresChecker::checkLocation(SVal l, bool isLoad, const Stmt *S,
   }
   SymbolRef Sym = l.getLocSymbolInBase();
   if (Sym){
-    llvm::outs() << "FOUND SYM: " << Sym << "\n";
     checkUseAfterFree(Sym, C, S);
   }
 
