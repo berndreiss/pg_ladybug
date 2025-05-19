@@ -223,7 +223,7 @@ void PostgresChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) con
   if (!FD)
     return;
 
-  if (FD->getNameAsString() == "pfree")
+  if (FD->getNameAsString() == "pfree" || FD->getNameAsString() == "free")
     return;
 
 
