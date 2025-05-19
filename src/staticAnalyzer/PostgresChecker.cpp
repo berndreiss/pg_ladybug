@@ -1,5 +1,4 @@
-
-//== ArrayBoundChecker.cpp ------------------------------*- C++ -*--==//
+//== PostgresChecker.cpp ------------------------------*- C++ -*--==//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -7,8 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This file defines ArrayBoundChecker, which is a path-sensitive check
-// which looks for an out-of-bound array element access.
+// This file defines PostgresChecker, which is a ...
 //
 //===----------------------------------------------------------------------===//
 
@@ -19,12 +17,14 @@
 #include "clang/StaticAnalyzer/Core/CheckerManager.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
-#include "clang/StaticAnalyzer/Core/PathSensitive/DynamicExtent.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/ExprEngine.h"
 #include <clang/AST/Decl.h>
 #include <clang/AST/Expr.h>
+#include <clang/Analysis/PathDiagnostic.h>
 #include <clang/Analysis/ProgramPoint.h>
 #include <clang/Basic/LLVM.h>
+#include <clang/Basic/SourceLocation.h>
+#include <clang/Basic/SourceManager.h>
 #include <clang/StaticAnalyzer/Core/BugReporter/BugReporter.h>
 #include <clang/StaticAnalyzer/Core/PathSensitive/ExplodedGraph.h>
 #include <clang/StaticAnalyzer/Core/PathSensitive/MemRegion.h>
@@ -64,9 +64,11 @@ private:
                           SymbolRef Sym, Category Cat) const;
   void HandleDoubleFree(CheckerContext &C, SourceRange Range, bool Released,
                         SymbolRef Sym, SymbolRef PrevSym, Category Cat) const;
+  void emitReport(SymbolRef Sym, BugType *BT, CheckerContext &C, std::string message) const;
 
 };
-
+} // end of anonymous namespace
+namespace {
 class RefState {
   enum Kind {
     // Reference to released/freed memory.
@@ -88,8 +90,12 @@ class RefState {
 
   Kind K;
 
-  RefState(Kind k, const Stmt *s)
-      : S(s), K(k) {}
+  ExplodedNode *EN;
+
+  const FunctionDecl *FD;
+
+  RefState(Kind k, const Stmt *s, ExplodedNode *EN, const FunctionDecl *FD)
+      : S(s), K(k), EN(EN), FD(FD) {}
 
 public:
   bool isReleased() const { return K == Released; }
@@ -97,27 +103,32 @@ public:
   bool isRelinquished() const { return K == Relinquished; }
   bool isEscaped() const { return K == Escaped; }
   const Stmt *getStmt() const { return S; }
+  const FunctionDecl *getFunction() const { return FD; }
+  ExplodedNode *getNode() const { return EN; }
 
   bool operator==(const RefState &X) const {
     return K == X.K && S == X.S;
   }
 
-  static RefState getReleased(const Stmt *s) {
-    return RefState(Released, s);
+  static RefState getReleased(const Stmt *s, ExplodedNode *EN, const FunctionDecl *FD) {
+    return RefState(Released, s, EN, FD);
   }
-  static RefState getPossiblyReleased(const Stmt *s) {
-    return RefState(PossiblyReleased, s);
+  static RefState getPossiblyReleased(const Stmt *s, ExplodedNode *EN, const FunctionDecl *FD) {
+    return RefState(PossiblyReleased, s, EN, FD);
   }
-  static RefState getRelinquished(const Stmt *s) {
-    return RefState(Relinquished, s);
+  static RefState getRelinquished(const Stmt *s, ExplodedNode *EN, const FunctionDecl *FD) {
+    return RefState(Relinquished, s, EN, FD);
   }
-  static RefState getEscaped(const RefState *RS) {
-    return RefState(Escaped, RS->getStmt());
+  static RefState getEscaped(const RefState *RS, ExplodedNode *EN, const FunctionDecl *FD) {
+    return RefState(Escaped, RS->getStmt(), EN, FD);
   }
 
+  
   void Profile(llvm::FoldingSetNodeID &ID) const {
     ID.AddInteger(K);
     ID.AddPointer(S);
+    ID.AddPointer(EN);
+    ID.AddPointer(FD);
   }
 
   LLVM_DUMP_METHOD void dump(raw_ostream &OS) const {
@@ -133,7 +144,7 @@ public:
   LLVM_DUMP_METHOD void dump() const { dump(llvm::errs()); }
 
 };
-}
+} // end of anonymous namespace
 
 REGISTER_MAP_WITH_PROGRAMSTATE(RegionState, SymbolRef, RefState)
 
@@ -179,12 +190,7 @@ void PostgresChecker::HandleUseAfterFree(CheckerContext &C, SourceRange Range,
 
   }
 
-  ExplodedNode *N = C.generateNonFatalErrorNode(C.getState(), this);
-  //ExplodedNode *N = C.generateErrorNode(C.getState(), this);
-  if (!N)
-    return;
-  auto R = std::make_unique<PathSensitiveBugReport>(*BT, message, N);
-  C.emitReport(std::move(R));
+  emitReport(Sym, BT, C, message);
 }
 
   void PostgresChecker::HandleDoubleFree(CheckerContext &C, SourceRange Range, bool Released,
@@ -207,12 +213,7 @@ void PostgresChecker::HandleUseAfterFree(CheckerContext &C, SourceRange Range,
 
   }
 
-  ExplodedNode *N = C.generateErrorNode(C.getState(), this);
-  //ExplodedNode *N = C.generateErrorNode(C.getState(), this);
-  if (!N)
-    return;
-  auto R = std::make_unique<PathSensitiveBugReport>(*BT, message, N);
-  C.emitReport(std::move(R));
+  emitReport(Sym, BT, C, message);
 }
 
 void PostgresChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
@@ -232,30 +233,11 @@ void PostgresChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) con
       SymbolRef Sym = ArgSVal.getAsSymbol();
       if (!Sym)
         continue;
-      if (checkUseAfterFree(Sym, C, Call.getArgExpr(I))){
+      if (checkUseAfterFree(Sym, C, Call.getArgExpr(I)))
         const auto *CE = dyn_cast_or_null<CallExpr>(Call.getOriginExpr());
-        //HandleUseAfterFree(C, CE->getSourceRange(), Sym);
-      }
     }
   }
 
-  //for (unsigned int i = 0; i < Call.getNumArgs(); i++){
-
-    //const ParmVarDecl *Param = FD->getParamDecl(i);
-    //auto arg = Call.getArgSVal(i);
-    //llvm::errs() << Param->getNameAsString() << "\n";
-
-    //if (std::optional<nonloc::ConcreteInt> CI = arg.getAs<nonloc::ConcreteInt>()){
-      //llvm::outs() << "Param " << Param->getNameAsString() << " has value: " << CI->getValue() << "\n";
-    //}else{
-      //llvm::outs() << "Param " << Param->getNameAsString() << " has no known value.\n";
-    //}
-
-    //std::optional<IntegerLiteral> IL = dyn_cast<IntegerLiteral>(arg);
-    //if (!IL)
-      //continue;
-    //llvm::errs() << IL.has_value() << "\n";
-  //}
 }
 
 void PostgresChecker::HandleStrictFree(const CallEvent &Call, CheckerContext &C) const{
@@ -277,24 +259,6 @@ void PostgresChecker::HandleFree(const CallEvent &Call, CheckerContext &C, Categ
   SVal ArgVal =  C.getSVal(Call.getArgExpr(0));
   if (!isa<DefinedOrUnknownSVal>(ArgVal))
     return;
-
-  //const Expr *ArgExpr = Call.getArgExpr(0);
-  //ArgExpr = ArgExpr->IgnoreParenImpCasts();
-
-  //if (const auto *DRE = dyn_cast<DeclRefExpr>(ArgExpr)) {
-    //if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())){
-    //const ValueDecl *VD = DRE->getDecl();
-    //llvm::errs() << "Argument is DeclRefExpr with: " << DRE << "\n";
-
-    // You can also get the region for this variable:
-    //const MemRegion *MR = State->getRegion(VD, C.getLocationContext());
-
-    //if (MR) {
-      //ArgVal = State->getSVal(MR);
-      // Now you have the SVal from the original memory region
-    //}
-  //}
-//}
 
   DefinedOrUnknownSVal location = ArgVal.castAs<DefinedOrUnknownSVal>();
   if (!isa<Loc>(location))
@@ -319,7 +283,7 @@ void PostgresChecker::HandleFree(const CallEvent &Call, CheckerContext &C, Categ
   //DO WE NEED THIS?
     // Blocks might show up as heap data, but should not be free()d
   //if (isa<BlockDataRegion>(R)) {
-    //HandleNonHeapDealloc(C, ArgVal, ArgExpr->getSourceRange(), ParentExpr,
+  //HandleNonHeapDealloc(C, ArgVal, ArgExpr->getSourceRange(), ParentExpr,
       //                   Family);
     //return nullptr;
   //}
@@ -365,8 +329,11 @@ void PostgresChecker::HandleFree(const CallEvent &Call, CheckerContext &C, Categ
       return;
     }
   }
+  ExplodedNode * EN = C.generateNonFatalErrorNode();
 
-  State = State->set<RegionState>(SymBase, RefState::getReleased(ParentExpr));
+  const FunctionDecl *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
+
+  State = State->set<RegionState>(SymBase, RefState::getReleased(ParentExpr, EN, FD));
 
   C.addTransition(State);
 }
@@ -388,26 +355,6 @@ void PostgresChecker::checkPostCall(const CallEvent &Call,
     HandleFree(Call, C, Strict);
     return;
   }
-  //if (const CheckFn *Callback = FreeingMemFnMap.lookup(Call)) {
-    //(*Callback)(this, Call, C);
-    //return;
-  //}
-
-  //if (const CheckFn *Callback = AllocatingMemFnMap.lookup(Call)) {
-    //(*Callback)(this, Call, C);
-    //return;
-  //}
-
-  //if (const CheckFn *Callback = ReallocatingMemFnMap.lookup(Call)) {
-    //(*Callback)(this, Call, C);
-    //return;
-  //}
-
-  //if (isStandardNewDelete(Call)) {
-    //checkCXXNewOrCXXDelete(Call, C);
-    //return;
-  //}
-
 }
 
 
@@ -449,34 +396,29 @@ void PostgresChecker::checkLocation(SVal l, bool isLoad, const Stmt *S,
   if (Sym){
     checkUseAfterFree(Sym, C, S);
   }
-
-
-        //if (const auto *E = dyn_cast<Expr>(S)) {
-    //E = E->IgnoreParenCasts(); // Optional, strips unnecessary casts
-          //
-          //if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
-    //if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
-         //SVal SVal = C.getState()->getSVal(l.castAs<Loc>());
-        //llvm::errs() << "Pointer address: " << SVal.getAsSymbol() << "\n";
-        //llvm::errs() << "Pointer address: " << SVal << "\n";
-              //if (l.getLocSymbolInBase()){
-              //checkUseAfterFree(SVal.getAsSymbol(), C, S);
-                //llvm::errs() << "THE MALLOC WAY: " << l.getLocSymbolInBase() << "\n";
-                //checkUseAfterFree(l.getLocSymbolInBase(), C, S);
-              //}
-    //}
-
-
-    //}
-  //}
-  //SymbolRef Sym = l.getLocSymbolInBase();
-  //if (Sym) {
-  //llvm::outs() << "SymbolRef: " << Sym << "\n";
-    //checkUseAfterFree(Sym, C, S);
-  //}
 }
 
 
+void PostgresChecker::emitReport(SymbolRef Sym, BugType *BT, CheckerContext &C, std::string message) const{
+  ExplodedNode *N = C.generateNonFatalErrorNode(C.getState(), this);
+  //ExplodedNode *N = C.generateErrorNode(C.getState(), this);
+  if (!N)
+    return;
+  auto R = std::make_unique<PathSensitiveBugReport>(*BT, message, N);
+  const RefState *RS = C.getState()->get<RegionState>(Sym);
+
+  if (!RS)
+    return;
+  PathDiagnosticLocation PDLoc = PathDiagnosticLocation::createBegin(
+    C.getState()->get<RegionState>(Sym)->getStmt(),
+    C.getSourceManager(),
+    C.getLocationContext()
+  ); 
+  const FunctionDecl *FD = RS->getFunction();
+  R->addNote("Freeing function" + (FD ? (": " + FD->getNameAsString()) : ""), PDLoc);
+  C.emitReport(std::move(R));
+  
+}
 
 namespace clang {
 namespace ento {
@@ -499,7 +441,4 @@ const char clang_analyzerAPIVersionString[] = CLANG_ANALYZER_API_VERSION_STRING;
 
 } // namespace ento
 } // namespace clang
-
-
-
 
