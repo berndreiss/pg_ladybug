@@ -351,6 +351,18 @@ void PostgresChecker::checkPostCall(const CallEvent &Call,
   if (!FD)
     return;
 
+  if (FD->getNameAsString() == "pfreedependent"){
+
+    auto arg = Call.getArgSVal(1);
+    //std::optional<IntegerLiteral> IL = dyn_cast<IntegerLiteral>(arg);
+    std::optional<nonloc::ConcreteInt> CI = arg.getAs<nonloc::ConcreteInt>();
+    if (!CI)
+      return;
+    if (CI->getValue() == 42)
+      HandleFree(Call, C, Strict);
+    return;
+  }
+
   if (FD->getName() == "pfree"){
     HandleFree(Call, C, Strict);
     return;
