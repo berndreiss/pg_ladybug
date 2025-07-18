@@ -451,6 +451,7 @@ llvm::StringMap<DependencyInfo> DependentMap{
       return False;
     })},
   {"DecrTupleDescRefCount", DependencyInfo(0, false, [](CallEvent &Call, CheckerContext &C){
+    return False; // ignore for now
     if (Call.getNumArgs() < 1) return Undefined;
       SVal tupdesc = Call.getArgSVal(0);
       SVal fieldVal = getFieldSVal(C, tupdesc, "tdrefcount");
