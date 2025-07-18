@@ -589,6 +589,8 @@ void PostgresChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) con
   const FunctionDecl *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
   if (!FD)
     return;
+  if (FD->hasBody() && FD->getNameAsString() != "free")
+    return;
   if (StrictMap.contains(FD->getNameAsString()) || DependentMap.contains(FD->getNameAsString()) || ArbitraryMap.contains(FD->getNameAsString()) || CMemoryMap.contains(FD->getNameAsString())){
 
   if (!Call.getOriginExpr())
