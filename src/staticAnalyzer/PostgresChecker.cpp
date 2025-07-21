@@ -34,6 +34,7 @@
 #include "clang/StaticAnalyzer/Core/PathSensitive/ExprEngine.h"
 #include <clang/AST/Decl.h>
 #include <clang/AST/Expr.h>
+#include <clang/AST/Stmt.h>
 #include <clang/Analysis/PathDiagnostic.h>
 #include <clang/Analysis/ProgramPoint.h>
 #include <clang/Basic/LLVM.h>
@@ -49,6 +50,7 @@
 #include <llvm/ADT/APSInt.h>
 #include <llvm/ADT/StringMap.h>
 #include <llvm/Object/ObjectFile.h>
+#include <llvm/Support/Casting.h>
 #include <llvm/Support/raw_ostream.h>
 #include <memory>
 #include <optional>
@@ -74,15 +76,15 @@ public:
   void checkLocation(SVal l, bool isLoad, const Stmt *S, CheckerContext &C) const;
   void checkPreStmt(const ReturnStmt *S, CheckerContext &C) const;
   void checkEndFunction(const ReturnStmt *S, CheckerContext &C) const;
-  bool checkUseAfterFree(SymbolRef Sym, CheckerContext &C, const Stmt * S) const;
+  bool checkUseAfterFree(SymbolRef Sym, std::string varName, CheckerContext &C, const Stmt * S) const;
 private:
   void HandleFree(const CallEvent &Call, CheckerContext &C, Category Cat) const;
   void HandleStrictFree(const CallEvent &Call, CheckerContext &C) const;
   void HandleDependentFree(const CallEvent &Call, CheckerContext &C, DependencyInfo DI) const;
   void HandleArbitraryFree(const CallEvent &Call, CheckerContext &C, std::string Str) const;
-  void HandleUseAfterFree(CheckerContext &C, SourceRange Range,
-                          SymbolRef Sym, Category Cat) const;
-  void HandleDoubleFree(CheckerContext &C, SourceRange Range, SymbolRef Sym, SymbolRef PrevSym, Category FirstFreeCat, Category Cat) const;
+  void HandleUseAfterFree(CheckerContext &C, SourceRange Range, SymbolRef Sym,
+                          std::string varName, Category Cat) const;
+  void HandleDoubleFree(CheckerContext &C, SourceRange Range, SymbolRef Sym, std::string varName, Category FirstFreeCat, Category Cat) const;
   void emitReport(SymbolRef Sym, BugType *BT, CheckerContext &C, std::string message) const;
   void checkEscapeOnReturn(const ReturnStmt *S, CheckerContext &C) const;
 
@@ -98,17 +100,16 @@ class RefState {
   };
 
   const Stmt *S;
-
   Kind K;
-
   ExplodedNode *EN;
-
   const FunctionDecl *FD;
+  std::string OriginalVarName;
 
-  RefState(Kind k, const Stmt *s, ExplodedNode *EN, const FunctionDecl *FD)
-      : S(s), K(k), EN(EN), FD(FD) {}
+  RefState(Kind k, const Stmt *s, ExplodedNode *EN, const FunctionDecl *FD, std::string varName)
+      : S(s), K(k), EN(EN), FD(FD), OriginalVarName(varName) {}
 
 public:
+  const std::string& getVarName() const { return OriginalVarName; }
   bool isReleased() const { return K == Released; }
   bool isPossiblyReleased() const { return K == PossiblyReleased; }
   const Stmt *getStmt() const { return S; }
@@ -119,11 +120,11 @@ public:
     return K == X.K && S == X.S;
   }
 
-  static RefState getReleased(const Stmt *s, ExplodedNode *EN, const FunctionDecl *FD) {
-    return RefState(Released, s, EN, FD);
+  static RefState getReleased(const Stmt *s, ExplodedNode *EN, const FunctionDecl *FD, std::string varName = "") {
+    return RefState(Released, s, EN, FD, varName);
   }
-  static RefState getPossiblyReleased(const Stmt *s, ExplodedNode *EN, const FunctionDecl *FD) {
-    return RefState(PossiblyReleased, s, EN, FD);
+  static RefState getPossiblyReleased(const Stmt *s, ExplodedNode *EN, const FunctionDecl *FD, std::string varName = "") {
+    return RefState(PossiblyReleased, s, EN, FD, varName);
   }
   
   void Profile(llvm::FoldingSetNodeID &ID) const {
@@ -360,6 +361,7 @@ llvm::StringMap<int> StrictMap{
 {{"yiddish_UTF_8_close_env"}, {0}},
 };
 
+
 SVal getFieldSVal(CheckerContext &C, SVal val, std::string fieldName){
 
   ProgramStateRef state = C.getState();
@@ -438,35 +440,35 @@ void printSVal(const SVal &sval) {
 llvm::StringMap<DependencyInfo> DependentMap{
   {"bms_int_members", DependencyInfo(0, true, [](CallEvent &Call, CheckerContext &C){
     if (Call.getNumArgs() < 2) return Undefined;
-      SVal val = Call.getArgSVal(1);
-      if (val.isUnknownOrUndef()) return Undefined;
-      if (val.isZeroConstant()) return True;
-      return False;
-    })},
+    SVal val = Call.getArgSVal(1);
+    if (val.isUnknownOrUndef()) return Undefined;
+    if (val.isZeroConstant()) return True;
+    return False;
+  })},
   {"bms_replace_members", DependencyInfo(0, true, [](CallEvent &Call, CheckerContext &C){
     if (Call.getNumArgs() < 2) return Undefined;
-      SVal val = Call.getArgSVal(1);
-      if (val.isUnknownOrUndef()) return Undefined;
-      if (val.isZeroConstant()) return True;
-      return False;
-    })},
+    SVal val = Call.getArgSVal(1);
+    if (val.isUnknownOrUndef()) return Undefined;
+    if (val.isZeroConstant()) return True;
+    return False;
+  })},
   {"DecrTupleDescRefCount", DependencyInfo(0, false, [](CallEvent &Call, CheckerContext &C){
-    return False; // ignore for now
+    return False;
     if (Call.getNumArgs() < 1) return Undefined;
-      SVal tupdesc = Call.getArgSVal(0);
-      SVal fieldVal = getFieldSVal(C, tupdesc, "tdrefcount");
-      return checkConcreteInt(fieldVal, [](const llvm::APSInt &a){return a == 1;});
+    SVal tupdesc = Call.getArgSVal(0);
+    SVal fieldVal = getFieldSVal(C, tupdesc, "tdrefcount");
+    return checkConcreteInt(fieldVal, [](const llvm::APSInt &a){return a == 1;});
   })},
   {"dump_variables", DependencyInfo(0, false, [](CallEvent &Call, CheckerContext &C){
     if (Call.getNumArgs() < 2) return Undefined;
-      SVal mode = Call.getArgSVal(1);
+    SVal mode = Call.getArgSVal(1);
     if (mode.isUnknownOrUndef())
       return Undefined;
     return checkConcreteInt(mode, [](const llvm::APSInt &a){return a !=0;});
   })},
   {"ExecForceStoreMinimalTuple", DependencyInfo(0, false, [](CallEvent &Call, CheckerContext &C){
     if (Call.getNumArgs() < 3) return Undefined;
-      SVal shouldFree = Call.getArgSVal(2);
+    SVal shouldFree = Call.getArgSVal(2);
     if (shouldFree.isUnknownOrUndef()) return Undefined;
     Tristate notFreeing = checkConcreteInt(shouldFree, [](const llvm::APSInt &a){return a == 0;});
     if (notFreeing == True) return False;
@@ -474,7 +476,7 @@ llvm::StringMap<DependencyInfo> DependentMap{
   })},
   {"ExecForceStoreHeapTuple", DependencyInfo(0, false, [](CallEvent &Call, CheckerContext &C){
     if (Call.getNumArgs() < 3) return Undefined;
-      SVal shouldFree = Call.getArgSVal(2);
+    SVal shouldFree = Call.getArgSVal(2);
     if (shouldFree.isUnknownOrUndef()) return Undefined;
     Tristate notFreeing = checkConcreteInt(shouldFree, [](const llvm::APSInt &a){return a == 0;});
     if (notFreeing == True) return False;
@@ -482,13 +484,13 @@ llvm::StringMap<DependencyInfo> DependentMap{
   })},
   {"ExecResetTupleTable", DependencyInfo(0, false, [](CallEvent &Call, CheckerContext &C){
     if (Call.getNumArgs() < 2) return Undefined;
-      SVal shouldFree = Call.getArgSVal(1);
+    SVal shouldFree = Call.getArgSVal(1);
     if (shouldFree.isUnknownOrUndef()) return Undefined;
     return checkConcreteInt(shouldFree, [](const llvm::APSInt &a){return a != 0;});
   })},
   {"freeJsonLexContext", DependencyInfo(0, false, [](CallEvent &Call, CheckerContext &C){
     if (Call.getNumArgs() < 1) return Undefined;
-      SVal lexContext = Call.getArgSVal(0);
+    SVal lexContext = Call.getArgSVal(0);
     if (lexContext.isUnknownOrUndef()) return Undefined;
     SVal flags = getFieldSVal(C, lexContext, "flags");
     if (flags.isUnknownOrUndef()) return Undefined;
@@ -498,7 +500,7 @@ llvm::StringMap<DependencyInfo> DependentMap{
   //ParallelBackupEnd
   {"pgfdw_report_error", DependencyInfo(1, false, [](CallEvent &Call, CheckerContext &C){
     if (Call.getNumArgs() < 4) return Undefined;
-      SVal clear = Call.getArgSVal(3);
+    SVal clear = Call.getArgSVal(3);
     if (clear.isUnknownOrUndef()) return Undefined;
     return checkConcreteInt(clear, [](const llvm::APSInt &a){return a != 0;});
   })},
@@ -562,8 +564,22 @@ llvm::StringMap<int> ArbitraryMap{
 {{"TableCommandResultHandler"}, {0}},
 };
 
+std::string getNameFromExpression(const Expr * Expr){
+  if (Expr) {
+    if (const DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(Expr)) {
+        if (const ValueDecl *VD = DRE->getDecl()) {
+            return VD->getNameAsString();
+        }
+    }
+    else if (const CastExpr *CE = dyn_cast<CastExpr>(Expr)) {
+        return getNameFromExpression(CE->getSubExpr());
+    }
+  }
+  return "";
+}
+
 void PostgresChecker::HandleUseAfterFree(CheckerContext &C, SourceRange Range,
-                          SymbolRef Sym, Category Cat) const{
+                          SymbolRef Sym, std::string varName, Category Cat) const{
 
   BugType *BT;
   std::string message;
@@ -584,10 +600,12 @@ void PostgresChecker::HandleUseAfterFree(CheckerContext &C, SourceRange Range,
       BT = BT_Free_Arbitrary.get();
     break;
   }
+  if (!varName.empty())
+    message = message + ": " + varName;
   emitReport(Sym, BT, C, message);
 }
 
-void PostgresChecker::HandleDoubleFree(CheckerContext &C, SourceRange Range, SymbolRef Sym, SymbolRef PrevSym, Category FirstFreeCat, Category Cat) const{
+void PostgresChecker::HandleDoubleFree(CheckerContext &C, SourceRange Range, SymbolRef Sym, std::string varName, Category FirstFreeCat, Category Cat) const{
 
   BugType *BT;
   std::string message;
@@ -614,15 +632,18 @@ void PostgresChecker::HandleDoubleFree(CheckerContext &C, SourceRange Range, Sym
     break;
 
   }
+  if (!varName.empty())
+    message = message + ": " + varName;
   emitReport(Sym, BT, C, message);
 }
 
 void PostgresChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
 
   const FunctionDecl *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
+
   if (!FD)
     return;
-  if (FD->hasBody() && FD->getNameAsString() != "free")
+  if (FD->hasBody() && FD->getNameAsString() != "free") 
     return;
   if (StrictMap.contains(FD->getNameAsString()) || DependentMap.contains(FD->getNameAsString()) || ArbitraryMap.contains(FD->getNameAsString()) || CMemoryMap.contains(FD->getNameAsString())){
 
@@ -648,7 +669,7 @@ void PostgresChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) con
   }
   //Handle arbitrary functions
   if (ArbitraryMap.contains(FD->getName())){
-    HandleFree(Call, C, Arbitrary);
+      HandleFree(Call, C, Arbitrary);
     return;
   }
     return;
@@ -659,7 +680,7 @@ void PostgresChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) con
       SymbolRef Sym = ArgSVal.getAsSymbol();
       if (!Sym)
         continue;
-      if (checkUseAfterFree(Sym, C, Call.getArgExpr(I)))
+      if (checkUseAfterFree(Sym, getNameFromExpression(Call.getArgExpr(I)), C, Call.getArgExpr(I)))
         const auto *CE = dyn_cast_or_null<CallExpr>(Call.getOriginExpr());
     }
   }
@@ -688,6 +709,7 @@ void PostgresChecker::HandleFree(const CallEvent &Call, CheckerContext &C, Categ
     return;
 
   SVal ArgVal;
+  const Expr *ArgExprFound;
   switch (Cat){
     case (Strict): {
       auto Position = StrictMap.lookup(FD->getName());
@@ -697,6 +719,7 @@ void PostgresChecker::HandleFree(const CallEvent &Call, CheckerContext &C, Categ
       if (!ArgExpr)
         return;
       ArgVal = C.getSVal(ArgExpr);
+      ArgExprFound = ArgExpr;
       break;
     }
     case (Dependent): {
@@ -724,6 +747,7 @@ void PostgresChecker::HandleFree(const CallEvent &Call, CheckerContext &C, Categ
           if (!ArgExpr)
             return;
           ArgVal = C.getSVal(ArgExpr);
+        ArgExprFound = ArgExpr;
         break;
       }
     }
@@ -735,6 +759,7 @@ void PostgresChecker::HandleFree(const CallEvent &Call, CheckerContext &C, Categ
       if (!ArgExpr)
         return;
       ArgVal = C.getSVal(ArgExpr);
+      ArgExprFound = ArgExpr;
       break; // doing this for safety reasons in case enum gets expanded
     }
   }
@@ -757,12 +782,11 @@ void PostgresChecker::HandleFree(const CallEvent &Call, CheckerContext &C, Categ
   SymbolRef SymBase = SrBase->getSymbol();
 
   const RefState *RsBase = State->get<RegionStatePG>(SymBase);
-  SymbolRef PreviousRetStatusSymbol = nullptr;
 
   if (RsBase){
     // Check for double free
       Category CatFirst = RsBase->isReleased() ? Strict : Arbitrary;
-      HandleDoubleFree(C, ParentExpr->getSourceRange(), SymBase, PreviousRetStatusSymbol, CatFirst, Cat);
+      HandleDoubleFree(C, ParentExpr->getSourceRange(), SymBase, getNameFromExpression(ArgExprFound), CatFirst, Cat);
   }
 
   // Generate an error node with information about the free location
@@ -774,15 +798,17 @@ void PostgresChecker::HandleFree(const CallEvent &Call, CheckerContext &C, Categ
   if (!EN)
     return;
 
+  std::string VarName = getNameFromExpression(ArgExprFound);
+
   // Depending on the category of the freeing function set a released or possibly released state
   switch (Cat){
     case Strict:
-      State = State->set<RegionStatePG>(SymBase, RefState::getReleased(ParentExpr, EN, FD));
+      State = State->set<RegionStatePG>(SymBase, RefState::getReleased(ParentExpr, EN, FD, VarName));
       break;
     case Dependent:
       break;// We should never get here
     case Arbitrary:
-      State = State->set<RegionStatePG>(SymBase, RefState::getPossiblyReleased(ParentExpr, EN, FD));
+      State = State->set<RegionStatePG>(SymBase, RefState::getPossiblyReleased(ParentExpr, EN, FD, VarName));
       break;
     default:
       return;
@@ -825,20 +851,19 @@ void PostgresChecker::checkEscapeOnReturn(const ReturnStmt *S,
               dyn_cast<SymbolicRegion>(MR->getBaseRegion()))
           Sym = BMR->getSymbol();
   if (Sym)
-    checkUseAfterFree(Sym, C, E);
+    checkUseAfterFree(Sym, getNameFromExpression(E), C, E);
 }
 
-bool PostgresChecker::checkUseAfterFree(SymbolRef Sym, CheckerContext &C, const Stmt * S) const{
-  assert(Sym);
+bool PostgresChecker::checkUseAfterFree(SymbolRef Sym, std::string varName, CheckerContext &C, const Stmt * S) const{
   const RefState *RS = C.getState()->get<RegionStatePG>(Sym);
   if (!RS)
     return false;
   if (RS && RS->isReleased()) {
-    HandleUseAfterFree(C, S->getSourceRange(), Sym, Strict);
+    HandleUseAfterFree(C, S->getSourceRange(), Sym, varName, Strict);
     return true;
   }
   if (RS && RS->isPossiblyReleased()) {
-    HandleUseAfterFree(C, S->getSourceRange(), Sym, Arbitrary);
+    HandleUseAfterFree(C, S->getSourceRange(), Sym, varName, Arbitrary);
     return true;
   }
   return false;
@@ -847,9 +872,19 @@ bool PostgresChecker::checkUseAfterFree(SymbolRef Sym, CheckerContext &C, const 
 // check whether the location accessed is a freed symbolic region.
 void PostgresChecker::checkLocation(SVal l, bool isLoad, const Stmt *S,
                                   CheckerContext &C) const {
+
   SymbolRef Sym = l.getLocSymbolInBase();
   if (Sym){
-    checkUseAfterFree(Sym, C, S);
+    std::string varName = "";
+    if (auto loc = l.getAs<Loc>()) {
+    if (const MemRegion *region = loc->getAsRegion()) {
+        if (const VarRegion *varRegion = dyn_cast<VarRegion>(region)) {
+            const VarDecl *varDecl = varRegion->getDecl();
+            varName = varDecl->getNameAsString();
+        }
+    }
+}
+    checkUseAfterFree(Sym, varName, C, S);
   }
 }
 
@@ -871,27 +906,28 @@ void PostgresChecker::emitReport(SymbolRef Sym, BugType *BT, CheckerContext &C, 
     C.getLocationContext()
   ); 
   const FunctionDecl *FD = RS->getFunction();
-  R->addNote("Freeing function" + (FD ? (": " + FD->getNameAsString()) : "<unknown>"), PDLoc);
+  std::string addition = RS->getVarName().empty() ? "" : (" (" + RS->getVarName() + ")");
+  R->addNote("Freeing function" + (FD ? (": " + FD->getNameAsString() + addition) : "<unknown>"), PDLoc);
   C.emitReport(std::move(R));
 }
 
 namespace clang {
 namespace ento {
-//void registerPostgresChecker(CheckerManager &mgr) {
-  //mgr.registerChecker<PostgresChecker>();
-//}
-
-//bool shouldRegisterPostgresChecker(const CheckerManager &mgr) {
-  //return true;
-//}
-extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
-  registry.addChecker<PostgresChecker>(
-      "postgres.PostgresChecker",
-      "Checks for use-after-free and double-free in PostgreSQL",
-      "");
+void registerPostgresChecker(CheckerManager &mgr) {
+  mgr.registerChecker<PostgresChecker>();
 }
-extern "C"
-const char clang_analyzerAPIVersionString[] = CLANG_ANALYZER_API_VERSION_STRING;
+
+bool shouldRegisterPostgresChecker(const CheckerManager &mgr) {
+  return true;
+}
+//extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  //registry.addChecker<PostgresChecker>(
+      //"postgres.PostgresChecker",
+      //"Checks for use-after-free and double-free in PostgreSQL",
+      //"");
+//}
+//extern "C"
+//const char clang_analyzerAPIVersionString[] = CLANG_ANALYZER_API_VERSION_STRING;
 
 } // namespace ento
 } // namespace clang
