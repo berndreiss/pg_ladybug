@@ -913,21 +913,21 @@ void PostgresChecker::emitReport(SymbolRef Sym, BugType *BT, CheckerContext &C, 
 
 namespace clang {
 namespace ento {
-void registerPostgresChecker(CheckerManager &mgr) {
-  mgr.registerChecker<PostgresChecker>();
-}
-
-bool shouldRegisterPostgresChecker(const CheckerManager &mgr) {
-  return true;
-}
-//extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
-  //registry.addChecker<PostgresChecker>(
-      //"postgres.PostgresChecker",
-      //"Checks for use-after-free and double-free in PostgreSQL",
-      //"");
+//void registerPostgresChecker(CheckerManager &mgr) {
+  //mgr.registerChecker<PostgresChecker>();
 //}
-//extern "C"
-//const char clang_analyzerAPIVersionString[] = CLANG_ANALYZER_API_VERSION_STRING;
+
+//bool shouldRegisterPostgresChecker(const CheckerManager &mgr) {
+  //return true;
+//}
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<PostgresChecker>(
+      "postgres.PostgresChecker",
+      "Checks for use-after-free and double-free in PostgreSQL",
+      "");
+}
+extern "C"
+const char clang_analyzerAPIVersionString[] = CLANG_ANALYZER_API_VERSION_STRING;
 
 } // namespace ento
 } // namespace clang
