@@ -173,7 +173,8 @@ llvm::StringMap<int> CMemoryMap{
 };
 
 llvm::StringMap<int> StrictMap{
-  {{"arabic_UTF_8_close_env"}, {0}},
+{{"free"}, {0}},
+{{"arabic_UTF_8_close_env"}, {0}},
 {{"armenian_UTF_8_close_env"}, {0}},
 {{"array_free_iterator"}, {0}},
 {{"basque_ISO_8859_1_close_env"}, {0}},
