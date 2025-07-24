@@ -1089,25 +1089,15 @@ void PostgresChecker::emitReport(const PGRefState *RS, BugType *BT,
 
 namespace clang {
 namespace ento {
-// Register the checker within the llvm-project context
-void registerPostgresChecker(CheckerManager &mgr) {
-  mgr.registerChecker<PostgresChecker>();
-}
-
-bool shouldRegisterPostgresChecker(const CheckerManager &mgr) {
-  return true;
-}
 // Register the checker as an extern .so file:
-//   - uncomment all the lines below
-//   - comment out the line above up to but not including the namespaces
-//extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
-  //registry.addChecker<PostgresChecker>(
-      //"postgres.PostgresChecker",
-      //"Checks for use-after-free and double-free in PostgreSQL",
-      //"");
-//}
-//extern "C"
-//const char clang_analyzerAPIVersionString[] = CLANG_ANALYZER_API_VERSION_STRING;
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<PostgresChecker>(
+      "postgres.PostgresChecker",
+      "Checks for use-after-free and double-free in PostgreSQL",
+      "");
+}
+extern "C"
+const char clang_analyzerAPIVersionString[] = CLANG_ANALYZER_API_VERSION_STRING;
 
 } // namespace ento
 } // namespace clang
