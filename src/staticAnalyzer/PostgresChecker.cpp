@@ -1098,7 +1098,6 @@ extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
 }
 extern "C"
 const char clang_analyzerAPIVersionString[] = CLANG_ANALYZER_API_VERSION_STRING;
-
 } // namespace ento
 } // namespace clang
 
