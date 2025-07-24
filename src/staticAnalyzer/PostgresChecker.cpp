@@ -1,4 +1,4 @@
-// Handle	pfree(*pubname);!!!
+// // Handle	pfree(*pubname);!!!
 //== PostgresChecker.cpp ------------------------------*- C++ -*--==//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
@@ -38,6 +38,7 @@
 #include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include <llvm/Support/raw_ostream.h>
 
 using namespace clang;
 using namespace ento;
@@ -688,16 +689,28 @@ llvm::StringSet<> ReassigningSet{
   {"list_delete_ptr"},
 };
 
-llvm::StringSet<> IgnoreDouble{
-  {"PQfinish"},
-};
-
 // Set containing functions where the return value
 // signifies whether the parameter has been freed.
 // The SmallPtrSet is optimized for small sets.
 llvm::StringSet<> BooleanSet{
   {"ecpg_check_PQresult"},
 };
+
+// Set of functions to be ignored for double-free
+llvm::StringSet<> IgnoreDouble{
+  {"PQfinish"},
+};
+
+// Map of functions to be ignored for use-after-free
+llvm::StringMap<unsigned int> IgnoreUse{
+  {"PQerrorMessage", 0},
+};
+
+// Map of functions to be ignored for use-after-free
+llvm::StringSet<> IgnoreAlltogether{
+  {"exit_nicely"},
+};
+
 // Helper function: retrieves the variable declaration from an expression and 
 // returns the name.
 std::string getNameFromExpression(const Expr * Expr){
@@ -797,6 +810,9 @@ void PostgresChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) con
   if (FD->hasBody()) 
     return;
 
+  if (IgnoreAlltogether.contains(FD->getNameAsString()))
+    return;
+
   // look up the function name in the maps
   if (StrictMap.contains(FD->getName()) 
     || DependentMap.contains(FD->getName()) 
@@ -828,6 +844,9 @@ void PostgresChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) con
   // we encountered a non-freeing function, for every parameter retrieve the 
   // symbolic value and, if it is a location, check for use-after-free
   for (unsigned I = 0, E = Call.getNumArgs(); I != E; ++I) {
+    // ignore special cases
+    if (IgnoreUse.contains(FD->getNameAsString()) && I == IgnoreUse.lookup(FD->getNameAsString()))
+      continue;
     SVal ArgSVal = Call.getArgSVal(I);
     if (isa<Loc>(ArgSVal)) {
       SymbolRef Sym = ArgSVal.getAsSymbol();
@@ -1098,6 +1117,7 @@ extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
 }
 extern "C"
 const char clang_analyzerAPIVersionString[] = CLANG_ANALYZER_API_VERSION_STRING;
+
 } // namespace ento
 } // namespace clang
 
