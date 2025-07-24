@@ -688,6 +688,10 @@ llvm::StringSet<> ReassigningSet{
   {"list_delete_ptr"},
 };
 
+llvm::StringSet<> IgnoreDouble{
+  {"PQfinish"},
+};
+
 // Set containing functions where the return value
 // signifies whether the parameter has been freed.
 // The SmallPtrSet is optimized for small sets.
@@ -743,7 +747,9 @@ void PostgresChecker::HandleUseAfterFree(CheckerContext &C, SourceRange Range,
   emitReport(RS, BT, C, message);
 }
 
-void PostgresChecker::HandleDoubleFree(CheckerContext &C, SourceRange Range, const PGRefState *RS, std::string varName, Category FirstFreeCat, Category Cat) const{
+void PostgresChecker::HandleDoubleFree(CheckerContext &C, SourceRange Range, 
+                                       const PGRefState *RS, std::string varName, 
+                                       Category FirstFreeCat, Category Cat) const{
 
   BugType *BT;
   // the message to be emitted as a warning
@@ -940,8 +946,9 @@ void PostgresChecker::HandleFree(const CallEvent &Call, CheckerContext &C,
       return;
     // determine the quality of the double-free
     Category CatFirst = RsBase->isReleased() ? Strict : Arbitrary;
-    HandleDoubleFree(C, ParentExpr->getSourceRange(), RsBase, 
-                     getNameFromExpression(ArgExpr), CatFirst, Cat);
+    if (!IgnoreDouble.contains(FD->getNameAsString()))
+      HandleDoubleFree(C, ParentExpr->getSourceRange(), RsBase, 
+                       getNameFromExpression(ArgExpr), CatFirst, Cat);
   }
 
   // the variable name to be used in a potential warning
@@ -1082,15 +1089,26 @@ void PostgresChecker::emitReport(const PGRefState *RS, BugType *BT,
 
 namespace clang {
 namespace ento {
-//Register the checker as an extern .so file:
-extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
-  registry.addChecker<PostgresChecker>(
-      "postgres.PostgresChecker",
-      "Checks for use-after-free and double-free in PostgreSQL",
-      "");
+// Register the checker within the llvm-project context
+void registerPostgresChecker(CheckerManager &mgr) {
+  mgr.registerChecker<PostgresChecker>();
 }
-extern "C"
-const char clang_analyzerAPIVersionString[] = CLANG_ANALYZER_API_VERSION_STRING;
+
+bool shouldRegisterPostgresChecker(const CheckerManager &mgr) {
+  return true;
+}
+// Register the checker as an extern .so file:
+//   - uncomment all the lines below
+//   - comment out the line above up to but not including the namespaces
+//extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  //registry.addChecker<PostgresChecker>(
+      //"postgres.PostgresChecker",
+      //"Checks for use-after-free and double-free in PostgreSQL",
+      //"");
+//}
+//extern "C"
+//const char clang_analyzerAPIVersionString[] = CLANG_ANALYZER_API_VERSION_STRING;
+
 } // namespace ento
 } // namespace clang
 
