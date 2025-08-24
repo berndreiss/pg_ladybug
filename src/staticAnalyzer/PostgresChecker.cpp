@@ -1,5 +1,4 @@
-// // Handle	pfree(*pubname);!!!
-//== PostgresChecker.cpp ------------------------------*- C++ -*--==//
+// //== PostgresChecker.cpp ------------------------------*- C++ -*--==//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -611,7 +610,8 @@ llvm::StringMap<DependencyInfo> DependentMap{
 // (potentially) freed
 llvm::StringMap<unsigned int> ArbitraryMap{
   // C function
-  {{"free"}, {0}},
+  {{"realloc"}, {0}},
+  {{"calloc"}, {0}},
   // PostgreSQL-specific functions
   {{"add_partial_path"}, {1}},
   {{"add_path"}, {1}},
@@ -623,7 +623,6 @@ llvm::StringMap<unsigned int> ArbitraryMap{
   {{"bms_join"}, {0}},
   {{"bms_join"}, {1}},
   {{"bms_replace_members"}, {0}},
-  {{"_bt_doinsert"}, {1}},
   {{"CheckAttributeType"}, {3}},
   {{"core_yyrealloc"}, {0}},
   {{"ecpg_check_PQresult"}, {0}},
@@ -656,7 +655,6 @@ llvm::StringMap<unsigned int> ArbitraryMap{
   {{"ReorderBufferQueueChange"}, {3}},
   {{"repalloc"}, {0}},
   {{"repalloc0"}, {0}},
-  {{"rewrite_heap_tuple"}, {1}},
   {{"rewrite_heap_tuple"}, {2}},
   {{"sequence_close"}, {0}},
   {{"SPI_repalloc"}, {0}},
@@ -698,17 +696,15 @@ llvm::StringSet<> BooleanSet{
 
 // Set of functions to be ignored for double-free
 llvm::StringSet<> IgnoreDouble{
-  {"PQfinish"},
 };
 
 // Map of functions to be ignored for use-after-free
 llvm::StringMap<unsigned int> IgnoreUse{
-  {"PQerrorMessage", 0},
+  //{"PQerrorMessage", 0},??
 };
 
 // Map of functions to be ignored for use-after-free
 llvm::StringSet<> IgnoreAlltogether{
-  {"exit_nicely"},
 };
 
 // Helper function: retrieves the variable declaration from an expression and 
@@ -1108,7 +1104,14 @@ void PostgresChecker::emitReport(const PGRefState *RS, BugType *BT,
 
 namespace clang {
 namespace ento {
-// Register the checker as an extern .so file:
+// Register the checker within the llvm-project context
+//void registerPostgresChecker(CheckerManager &mgr) {
+  //mgr.registerChecker<PostgresChecker>();
+//}
+
+//bool shouldRegisterPostgresChecker(const CheckerManager &mgr) {
+  //return true;
+//}
 extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
   registry.addChecker<PostgresChecker>(
       "postgres.PostgresChecker",
@@ -1120,3 +1123,4 @@ const char clang_analyzerAPIVersionString[] = CLANG_ANALYZER_API_VERSION_STRING;
 
 } // namespace ento
 } // namespace clang
+
