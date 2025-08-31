@@ -1,4 +1,4 @@
-// //== PostgresChecker.cpp ------------------------------*- C++ -*--==//
+//== PostgresChecker.cpp ------------------------------*- C++ -*--==//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -369,7 +369,7 @@ SVal getFieldSVal(CheckerContext &C, SVal val, std::string fieldName){
   const TypedValueRegion *typedRegion = dyn_cast<TypedValueRegion>(baseRegion);
   if (!typedRegion) 
     return UndefinedVal();
-  // retrieve the type to detec tag type objects like structs and retrieve the
+  // retrieve the type to detect objects like structs and retrieve the
   // declaration of the record
   QualType structType = typedRegion->getValueType();
   const RecordType *recordType = structType->getAsStructureType();
@@ -393,7 +393,7 @@ SVal getFieldSVal(CheckerContext &C, SVal val, std::string fieldName){
   return UndefinedVal();
 }
 
-// Check whether a symbolic value represents a concrete integer and satisfies the
+// Check whether a symbolic value represents a concrete integer and satisfies
 // the conditions defined by the comparator. The comparator should be defined as 
 // follows: [](const llvm::ASPInt &x){ condition -> e.g. return x==0; }
 template<typename Comparator>
@@ -434,8 +434,8 @@ void printSVal(const SVal &sval) {
 // Map holding all dependent functions: maps function names to DependencyInfo.
 // The callback to isFreeing will always extract the parameter the free is 
 // dependent on and determine the condition. When the condition can not be 
-// determined, Undefined is returned. For clarity reasons beofre every entry a 
-// briefly comment descrbes what we check for.
+// determined, Undefined is returned. For clarity reasons before every entry a 
+// comment briefly describes what we check for.
 // To better understand what is happening here, it is highly recommended to look
 // at the source code of the functions at https://github.com/postgres/postgres or
 // https://doxygen.postgresql.org/.
@@ -577,7 +577,7 @@ llvm::StringMap<DependencyInfo> DependentMap{
   // WE IGNORE THE REST FOR NOW: the checker will not actually see the values, 
   // associated with the relevant fields, since they involve counting of 
   // characteristics like 'size' that is handled internally. We would have
-  // to simulate this behaviour, which is possible but not implemented yet.
+  // to simulate this behavior, which is possible but not implemented yet.
   // As is the inclusion of these functions leads to false positives.
   // 'tdrefcount == 1'
   {"DecrTupleDescRefCount", DependencyInfo(0, false, [](CallEvent &Call, 
@@ -689,7 +689,6 @@ llvm::StringSet<> ReassigningSet{
 
 // Set containing functions where the return value
 // signifies whether the parameter has been freed.
-// The SmallPtrSet is optimized for small sets.
 llvm::StringSet<> BooleanSet{
   {"ecpg_check_PQresult"},
 };
@@ -700,10 +699,9 @@ llvm::StringSet<> IgnoreDouble{
 
 // Map of functions to be ignored for use-after-free
 llvm::StringMap<unsigned int> IgnoreUse{
-  //{"PQerrorMessage", 0},??
 };
 
-// Map of functions to be ignored for use-after-free
+// Map of functions to be ignored alltogether
 llvm::StringSet<> IgnoreAlltogether{
 };
 
@@ -740,7 +738,7 @@ void PostgresChecker::HandleUseAfterFree(CheckerContext &C, SourceRange Range,
       BT = BT_Free_Strict.get();
     break;
     // we should not be here, this could be handled better (maybe introduce 
-    // another enum?)
+    // another enum entry?)
     case (Dependent):
       return;
     case (Arbitrary):
@@ -774,7 +772,7 @@ void PostgresChecker::HandleDoubleFree(CheckerContext &C, SourceRange Range,
       BT = BT_Free_Strict.get();
     break;
     // we should not be here, this could be handled better (maybe introduce 
-    // another enum?)
+    // another enum entry?)
     case (Dependent):
       return;
     case (Arbitrary):
@@ -882,7 +880,7 @@ void PostgresChecker::HandleFree(const CallEvent &Call, CheckerContext &C,
     }
     // dependent functions:
     //   - retrieve the DependencyInfo
-    //   - call Info.isFreeing(): if true, handle function as strict
+    //   - call Info.isFreeing(): if True, handle function as strict
     //   - if Undefined or not freeing and the Info.isArbitrary fallback option
     //     is set, treat the function as arbitrary
     //   - otherwise do nothing
@@ -1112,6 +1110,9 @@ namespace ento {
 //bool shouldRegisterPostgresChecker(const CheckerManager &mgr) {
   //return true;
 //}
+// Register the checker as an extern .so file:
+//   - uncomment all the lines below
+//   - comment out the line above up to but not including the namespaces
 extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
   registry.addChecker<PostgresChecker>(
       "postgres.PostgresChecker",
@@ -1123,4 +1124,3 @@ const char clang_analyzerAPIVersionString[] = CLANG_ANALYZER_API_VERSION_STRING;
 
 } // namespace ento
 } // namespace clang
-
