@@ -12,6 +12,12 @@ pg_ladybug checks for the following patterns:
 - passing large int into Bitmapset
 - missing assignment for return value of Bitmapset functions
 
+## PostgresChecker
+
+Uses the Clang Static Analyzer framework to find use-after-ftee bugs for code using the postgres API.
+
+For more information see the bachelor thesis added as a pdf here.
+
 ## Installation
 
 ```
@@ -30,6 +36,8 @@ sudo make -C build install
 - llvm
 
 ### Usage
+
+#### pg_ladybug
 
 Verify checks are present:
 ```
@@ -51,4 +59,14 @@ file.c:227:30: error: potential wrong function argument. bms_add_member called w
 Suppressed 2 warnings (2 in non-user code).
 Use -header-filter=.* to display errors from all non-system headers. Use -system-headers to display errors from system headers as well.
 ```
+#### PostgresChecker
 
+Verify:
+```
+clang-19 -cc1 -load /usr/local/lib/libPostgresChecker.so -analyzer checker-help | grep postgres
+```
+
+Usage:
+```
+clang-19 --analyze -Xclang -load -Xclang /usr/local/lib/libPostgresChecker.so -Xclang -analyzer-checker=postgres.PostgresChecker file.c
+```
