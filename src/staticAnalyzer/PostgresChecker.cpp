@@ -35,8 +35,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "llvm/ADT/SmallVector.h"
 #include <llvm/Support/raw_ostream.h>
 
 using namespace clang;
@@ -49,7 +51,8 @@ enum Tristate {True, False, Undefined};
 
 namespace{
 class PostgresChecker :
-    public Checker<check::PreCall, check::Location, check::PreStmt<ReturnStmt>> {
+    public Checker<check::PreCall, check::Location, check::PreStmt<ReturnStmt>,
+                   check::DeadSymbols> {
   mutable std::unique_ptr<BugType> BT_Free_Strict;
   mutable std::unique_ptr<BugType> BT_Free_Arbitrary;
 
@@ -58,25 +61,34 @@ public:
   void checkLocation(SVal l, bool isLoad, const Stmt *S, 
                      CheckerContext &C) const;
   void checkPreStmt(const ReturnStmt *S, CheckerContext &C) const;
+  void checkDeadSymbols(SymbolReaper &SymReaper, CheckerContext &C) const;
   bool checkUseAfterFree(SymbolRef Sym, std::string varName, 
                          CheckerContext &C, const Stmt * S) const;
 private:
   void HandleFree(const CallEvent &Call, CheckerContext &C, 
                         Category Cat) const;
   void HandleUseAfterFree(CheckerContext &C, SourceRange Range, const 
-                          PGRefState *RS, std::string varName, 
-                          Category Cat) const;
+                          PGRefState *RS, SymbolRef Sym, std::string varName, 
+                          Category Cat, ExplodedNode *N) const;
   void HandleDoubleFree(CheckerContext &C, SourceRange Range, 
-                        const PGRefState *RS, std::string varName, 
-                        Category FirstFreeCat, Category Cat) const;
-  void emitReport(const PGRefState *RS, BugType *BT, CheckerContext &C, 
-                  std::string message) const;
+                        const PGRefState *RS, SymbolRef Sym,
+                        std::string varName, 
+                        Category FirstFreeCat, Category Cat,
+                        ExplodedNode *N) const;
+  void emitReport(const PGRefState *RS, SymbolRef Sym, BugType *BT,
+                  CheckerContext &C, std::string message,
+                  ExplodedNode *N) const;
 };
 } // end of anonymous namespace
 
 // Map that tracks PGRefStates for symbol references. Entries are defined in the 
 // state of the CheckContext and can be accessed on all successive paths.
 REGISTER_MAP_WITH_PROGRAMSTATE(RegionStatePG, SymbolRef, PGRefState)
+
+// Symbols for which a use-after-free or double-free has already been reported
+// on the current path. Further reports for them are suppressed, so that one
+// bad free does not produce a warning for every subsequent use.
+REGISTER_SET_WITH_PROGRAMSTATE(ReportedPG, SymbolRef)
 
 // Storing the state at the function call.
 class PGRefState {
@@ -105,7 +117,7 @@ public:
 
   bool operator==(const PGRefState &X) const {
     return K == X.K && S == X.S && FD == X.FD 
-           && OriginalVarName == OriginalVarName;
+           && OriginalVarName == X.OriginalVarName;
   }
 
   static PGRefState getReleased(const Stmt *s, const FunctionDecl *fd, 
@@ -143,9 +155,15 @@ llvm::StringMap<int> CMemoryMap{
  {{"realloc"}, {0}}, 
 };
 
-// Map representing strict functions: the function names are mapped to the index 
-// of the parameter being freed.
-llvm::StringMap<unsigned int> StrictMap{
+// List of parameter positions a function frees. Most functions free a single
+// parameter, but some free several (e.g. updateAclDependencies). A StringMap
+// keeps only the first of several entries with the same key, so functions
+// freeing more than one parameter must list all positions in one entry.
+using FreedPositions = llvm::SmallVector<unsigned int, 2>;
+
+// Map representing strict functions: the function names are mapped to the
+// indices of the parameters being freed.
+llvm::StringMap<FreedPositions> StrictMap{
   // C function
   {{"free"}, {0}},
   // PostgreSQL-specific functions
@@ -318,7 +336,9 @@ llvm::StringMap<unsigned int> StrictMap{
   {{"systable_endscan"}, {0}},
   {{"systable_endscan_ordered"}, {0}},
   {{"tamil_UTF_8_close_env"}, {0}},
-  {{"tbm_end_iterate"}, {0}},
+  // tbm_end_iterate is intentionally not listed: it frees the private/shared
+  // iterator the TBMIterator points to, not the TBMIterator itself, which is
+  // usually embedded in another struct (e.g. TableScanDesc->st.rs_tbmiterator).
   {{"tbm_end_shared_iterate"}, {0}},
   {{"tbm_free"}, {0}},
   {{"TidStoreDestroy"}, {0}},
@@ -327,10 +347,8 @@ llvm::StringMap<unsigned int> StrictMap{
   {{"toast_close_indexes"}, {0}},
   {{"tuplestore_end"}, {0}},
   {{"turkish_UTF_8_close_env"}, {0}},
-  {{"updateAclDependencies"}, {5}},
-  {{"updateAclDependencies"}, {7}},
-  {{"updateInitAclDependencies"}, {4}},
-  {{"updateInitAclDependencies"}, {6}},
+  {{"updateAclDependencies"}, {5, 7}},
+  {{"updateInitAclDependencies"}, {4, 6}},
   {{"vac_close_indexes"}, {1}},
   {{"XLogPrefetcherFree"}, {0}},
   {{"XLogReaderFree"}, {0}},
@@ -440,6 +458,23 @@ void printSVal(const SVal &sval) {
 // at the source code of the functions at https://github.com/postgres/postgres or
 // https://doxygen.postgresql.org/.
 llvm::StringMap<DependencyInfo> DependentMap{
+  // 'new_path is not an IndexPath'
+  // add_path may pfree a rejected new_path, but never an IndexPath, because
+  // IndexPaths can also be referenced by bitmap paths (see the comment above
+  // add_path in optimizer/util/pathnode.c). Callers usually pass the path via
+  // a cast like '(Path *) ipath', so look at the type under the casts.
+  {"add_path", DependencyInfo(1, false, [](CallEvent &Call,
+                                           CheckerContext &C){
+    if (Call.getNumArgs() < 2) return Undefined;
+    const Expr *E = Call.getArgExpr(1);
+    if (!E) return Undefined;
+    QualType T = E->IgnoreParenCasts()->getType();
+    if (const auto *PT = T->getAs<PointerType>())
+      if (const auto *RT = PT->getPointeeType()->getAs<RecordType>())
+        if (RT->getDecl()->getName() == "IndexPath")
+          return False;
+    return Undefined;
+  })},
   // 'b == NULL'
   {"bms_int_members", DependencyInfo(0, true, [](CallEvent &Call, 
                                                  CheckerContext &C){
@@ -544,9 +579,11 @@ llvm::StringMap<DependencyInfo> DependentMap{
     if (Call.getNumArgs() < 4) return Undefined;
     // get the pointer to destsz
     SVal destszValPtr = Call.getArgSVal(3);
-                                      ProgramStateRef State = C.getState();
-    // dereference the pointer
-    SVal destszVal = State->getSVal(destszValPtr.castAs<Loc>(), 
+    ProgramStateRef State = C.getState();
+    // dereference the pointer (castAs<Loc>() would assert on an unknown value)
+    std::optional<Loc> destszLoc = destszValPtr.getAs<Loc>();
+    if (!destszLoc) return Undefined;
+    SVal destszVal = State->getSVal(*destszLoc,
                                    C.getASTContext().getSizeType());
     if (destszVal.isUnknownOrUndef()) return Undefined;
 
@@ -564,9 +601,11 @@ llvm::StringMap<DependencyInfo> DependentMap{
     // extract concrete integers and compare them
     std::optional<nonloc::ConcreteInt> lenConcrete = lenVal.getAs<nonloc::ConcreteInt>();
     std::optional<nonloc::ConcreteInt> destszConcrete = destszVal.getAs<nonloc::ConcreteInt>();
+    // only compare when both values are known constants
+    if (!lenConcrete || !destszConcrete) return Undefined;
     const llvm::APSInt &lenAPS = lenConcrete->getValue();
     const llvm::APSInt &destszAPS = destszConcrete->getValue();
-    int cmpResult = lenAPS.compareValues(lenAPS, destszAPS);
+    int cmpResult = llvm::APSInt::compareValues(lenAPS, destszAPS);
 
     // len > *destsz
     if (cmpResult > 0)
@@ -585,7 +624,7 @@ llvm::StringMap<DependencyInfo> DependentMap{
     return False;
   })},
   // 'pstate->numWorkers == 1'
-  {"ParallelBackupEnd,ParallelState", DependencyInfo(1, false, [](CallEvent &Call,
+  {"ParallelBackupEnd", DependencyInfo(1, false, [](CallEvent &Call,
                                                                CheckerContext &C){
     return False;
   })},
@@ -606,22 +645,20 @@ llvm::StringMap<DependencyInfo> DependentMap{
   })},
 };
 
-// Map for arbitrary functions: maps the function name to the index being 
+// Map for arbitrary functions: maps the function name to the indices being 
 // (potentially) freed
-llvm::StringMap<unsigned int> ArbitraryMap{
+llvm::StringMap<FreedPositions> ArbitraryMap{
   // C function
   {{"realloc"}, {0}},
-  {{"calloc"}, {0}},
   // PostgreSQL-specific functions
   {{"add_partial_path"}, {1}},
-  {{"add_path"}, {1}},
+  // add_path is handled in DependentMap (it never frees IndexPaths)
   {{"bms_add_member"}, {0}},
   {{"bms_add_members"}, {0}},
   {{"bms_add_range"}, {0}},
   {{"bms_del_member"}, {0}},
   {{"bms_del_members"}, {0}},
-  {{"bms_join"}, {0}},
-  {{"bms_join"}, {1}},
+  {{"bms_join"}, {0, 1}},
   {{"bms_replace_members"}, {0}},
   {{"CheckAttributeType"}, {3}},
   {{"core_yyrealloc"}, {0}},
@@ -631,7 +668,8 @@ llvm::StringMap<unsigned int> ArbitraryMap{
   {{"FreeDir"}, {0}},
   {{"gistjoinvector"}, {0}},
   {{"index_close"}, {0}},
-  {{"InsertPgAttributeTuples"}, {4}},
+  // InsertPgAttributeTuples is intentionally not listed: it only closes an
+  // index state it opened itself (when the caller passed NULL).
   {{"_int_unique"}, {0}},
   {{"resize_intArrayType"}, {0}},
   {{"jsonpath_yyrealloc"}, {0}},
@@ -649,13 +687,13 @@ llvm::StringMap<unsigned int> ArbitraryMap{
   {{"pg_realloc"}, {0}},
   {{"relation_close"}, {0}},
   {{"RelationClose"}, {0}},
-  {{"relation_is_updatable"}, {1}},
-  {{"relation_is_updatable"}, {3}},
+  {{"relation_is_updatable"}, {1, 3}},
   {{"ReleaseCatCacheList"}, {0}},
   {{"ReorderBufferQueueChange"}, {3}},
   {{"repalloc"}, {0}},
   {{"repalloc0"}, {0}},
-  {{"rewrite_heap_tuple"}, {2}},
+  // rewrite_heap_tuple is intentionally not listed: it only frees its own
+  // copies of tuples (guarded by free_new), never the caller's new_tuple.
   {{"sequence_close"}, {0}},
   {{"SPI_repalloc"}, {0}},
   {{"table_close"}, {0}},
@@ -722,10 +760,18 @@ std::string getNameFromExpression(const Expr * Expr){
   return "";
 }
 
+// Stable bug type names. Previously the bug type was named after whichever
+// message happened to be emitted first, so the category shown in HTML/SARIF
+// output depended on the order of the reports.
+static const char *const BTNameStrict =
+    "Use or free of released memory (PostgreSQL API)";
+static const char *const BTNameArbitrary =
+    "Use or free of potentially released memory (PostgreSQL API)";
+
 void PostgresChecker::HandleUseAfterFree(CheckerContext &C, SourceRange Range,
-                                         const PGRefState *RS, 
+                                         const PGRefState *RS, SymbolRef Sym,
                                          std::string varName, 
-                                         Category Cat) const{
+                                         Category Cat, ExplodedNode *N) const{
 
   BugType *BT;
   // the message to be emitted as a warning
@@ -734,7 +780,7 @@ void PostgresChecker::HandleUseAfterFree(CheckerContext &C, SourceRange Range,
     case (Strict):
       message = "Attempt to use released memory";
       if (!BT_Free_Strict)
-        BT_Free_Strict.reset(new BugType(this, message));
+        BT_Free_Strict.reset(new BugType(this, BTNameStrict));
       BT = BT_Free_Strict.get();
     break;
     // we should not be here, this could be handled better (maybe introduce 
@@ -744,19 +790,21 @@ void PostgresChecker::HandleUseAfterFree(CheckerContext &C, SourceRange Range,
     case (Arbitrary):
       message = "Attempt to use potentially released memory";
       if (!BT_Free_Arbitrary)
-        BT_Free_Arbitrary.reset(new BugType(this, message));
+        BT_Free_Arbitrary.reset(new BugType(this, BTNameArbitrary));
       BT = BT_Free_Arbitrary.get();
     break;
   }
   // add the variable to the message name if it exists
   if (!varName.empty())
     message = message + ": " + varName;
-  emitReport(RS, BT, C, message);
+  emitReport(RS, Sym, BT, C, message, N);
 }
 
 void PostgresChecker::HandleDoubleFree(CheckerContext &C, SourceRange Range, 
-                                       const PGRefState *RS, std::string varName, 
-                                       Category FirstFreeCat, Category Cat) const{
+                                       const PGRefState *RS, SymbolRef Sym,
+                                       std::string varName,
+                                       Category FirstFreeCat, Category Cat,
+                                       ExplodedNode *N) const{
 
   BugType *BT;
   // the message to be emitted as a warning
@@ -768,7 +816,7 @@ void PostgresChecker::HandleDoubleFree(CheckerContext &C, SourceRange Range,
       else
         message = "Attempt to free released memory";
       if (!BT_Free_Strict)
-        BT_Free_Strict.reset(new BugType(this, message));
+        BT_Free_Strict.reset(new BugType(this, BTNameStrict));
       BT = BT_Free_Strict.get();
     break;
     // we should not be here, this could be handled better (maybe introduce 
@@ -781,7 +829,7 @@ void PostgresChecker::HandleDoubleFree(CheckerContext &C, SourceRange Range,
       else
         message = "Possible attempt to free released memory";
       if (!BT_Free_Arbitrary)
-        BT_Free_Arbitrary.reset(new BugType(this, message));
+        BT_Free_Arbitrary.reset(new BugType(this, BTNameArbitrary));
       BT = BT_Free_Arbitrary.get();
     break;
 
@@ -789,7 +837,7 @@ void PostgresChecker::HandleDoubleFree(CheckerContext &C, SourceRange Range,
   // add the variable to the message name if it exists
   if (!varName.empty())
     message = message + ": " + varName;
-  emitReport(RS, BT, C, message);
+  emitReport(RS, Sym, BT, C, message, N);
 }
 
 // If the function is freeing -> call HandleFree; otherwise, call 
@@ -799,8 +847,11 @@ void PostgresChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) con
   const FunctionDecl *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
   if (!FD)
     return;
-  // if the function has a body, we return. If there is a call to a freeing 
-  // function inside we see it anyways
+  // If the function has a body in this translation unit, the analyzer will
+  // usually inline it, and we see the calls to freeing functions inside it.
+  // Note: if the analyzer decides not to inline it (e.g. because it is too
+  // large), frees inside it are not seen, and the maps are not consulted
+  // either.
   if (FD->hasBody()) 
     return;
 
@@ -852,6 +903,15 @@ void PostgresChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) con
   }
 }
 
+// A double free found while handling one call; reported after all freed
+// arguments of the call have been processed.
+struct PendingDoubleFree {
+  PGRefState RS;
+  SymbolRef Sym;
+  std::string VarName;
+  Category FirstFreeCat;
+};
+
 void PostgresChecker::HandleFree(const CallEvent &Call, CheckerContext &C, 
                                  Category Cat) const{
 
@@ -861,131 +921,133 @@ void PostgresChecker::HandleFree(const CallEvent &Call, CheckerContext &C,
   const FunctionDecl *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
   if (!FD)
     return;
+  // get parent expression to have access to the source location
+  const Expr *ParentExpr = Call.getOriginExpr();
+  if (!ParentExpr)
+    return;
 
-  SVal ArgVal;
-  // keep track of the expression we found to add the name of the variable to 
-  // a potential warning
-  const Expr *ArgExpr;
+  // the positions of the arguments being (potentially) freed
+  FreedPositions Positions;
   switch (Cat){
-    // strict function -> get the position of the argument and retrieve it
-    case (Strict): {
-      auto Position = StrictMap.lookup(FD->getName());
-      if (Call.getNumArgs() <= Position)
-        return;
-      ArgExpr = Call.getArgExpr(Position);
-      if (!ArgExpr)
-        return;
-      ArgVal = C.getSVal(ArgExpr);
+    // strict function -> get the positions of the arguments
+    case (Strict):
+      Positions = StrictMap.lookup(FD->getName());
       break;
-    }
     // dependent functions:
     //   - retrieve the DependencyInfo
     //   - call Info.isFreeing(): if True, handle function as strict
     //   - if Undefined or not freeing and the Info.isArbitrary fallback option
     //     is set, treat the function as arbitrary
     //   - otherwise do nothing
-    //   - if we do something, get position of the argument and retrieve it
     case (Dependent): {
       auto It = DependentMap.find(FD->getName());
-      if (It != DependentMap.end()) {
-        DependencyInfo Info = It->second;
-        if (Call.getNumArgs() <= Info.positionFreed)
-          return;
-        auto result = Info.isFreeing(const_cast<CallEvent &>(Call), C);
-        //function is freeing
-        if (result == True){
-          Cat = Strict;
-        // function is not freeing
-        } else if (result == False){
-          //fall back to arbitrary?
-          if (Info.isArbitrary)
-            Cat = Arbitrary;
-          //function does not free at all
-          else
-           return;
-        // ifFreeing could not be determined
-        } else
-            Cat = Arbitrary;
-        ArgExpr = Call.getArgExpr(Info.positionFreed);
-        if (!ArgExpr)
-          return;
-        ArgVal = C.getSVal(ArgExpr);
-        break;
-      }
-      // we did not retrieve anything
-      return;
-    }
-    // arbitrary function -> get the position of the argument and retrieve it
-    case (Arbitrary): {
-      auto Position = ArbitraryMap.lookup(FD->getName());
-      if (Call.getNumArgs() <= Position)
+      if (It == DependentMap.end())
         return;
-      ArgExpr = Call.getArgExpr(Position);
-      if (!ArgExpr)
+      DependencyInfo Info = It->second;
+      if (Call.getNumArgs() <= Info.positionFreed)
         return;
-      ArgVal = C.getSVal(ArgExpr);
-      break; // doing this for safety reasons in case enum gets expanded
+      auto result = Info.isFreeing(const_cast<CallEvent &>(Call), C);
+      //function is freeing
+      if (result == True){
+        Cat = Strict;
+      // function is not freeing
+      } else if (result == False){
+        //fall back to arbitrary?
+        if (Info.isArbitrary)
+          Cat = Arbitrary;
+        //function does not free at all
+        else
+         return;
+      // ifFreeing could not be determined
+      } else
+          Cat = Arbitrary;
+      Positions.push_back(Info.positionFreed);
+      break;
     }
+    // arbitrary function -> get the positions of the arguments
+    case (Arbitrary):
+      Positions = ArbitraryMap.lookup(FD->getName());
+      break;
   }
-
-  if (ArgVal.isUnknownOrUndef())
-    return;
-  const MemRegion *R = ArgVal.getAsRegion();
-  if (!R)
-    return;
-  // get parent expression to have access to the source location
-  const Expr *ParentExpr = Call.getOriginExpr();
-  if (!ParentExpr)
-    return;
-
-  // remove casts and retrieve the base symbolic region
-  R = R->StripCasts();
-  const SymbolicRegion *SrBase = dyn_cast<SymbolicRegion>(R->getBaseRegion());
-  if (!SrBase)
-    return;
 
   ProgramStateRef State = C.getState();
   if (!State)
     return;
-  // look up the symbol reference in the RegionStatePG map. If found, handle 
-  // double-free
-  SymbolRef SymBase = SrBase->getSymbol();
-  const PGRefState *RsBase = State->get<RegionStatePG>(SymBase);
-  if (RsBase){
-    // if both the old and the new functions are C functions ignore
-    // -> we don't want to get in the way of the MallocChecker
-    if (CMemoryMap.contains(RsBase->getFunction()->getName()) 
-      && CMemoryMap.contains(FD->getName()))
-      return;
-    // determine the quality of the double-free
-    Category CatFirst = RsBase->isReleased() ? Strict : Arbitrary;
-    if (!IgnoreDouble.contains(FD->getNameAsString()))
-      HandleDoubleFree(C, ParentExpr->getSourceRange(), RsBase, 
-                       getNameFromExpression(ArgExpr), CatFirst, Cat);
+  bool Changed = false;
+  llvm::SmallVector<PendingDoubleFree, 1> DoubleFrees;
+
+  for (unsigned Position : Positions) {
+    if (Call.getNumArgs() <= Position)
+      continue;
+    const Expr *ArgExpr = Call.getArgExpr(Position);
+    if (!ArgExpr)
+      continue;
+    SVal ArgVal = C.getSVal(ArgExpr);
+    if (ArgVal.isUnknownOrUndef())
+      continue;
+    const MemRegion *R = ArgVal.getAsRegion();
+    if (!R)
+      continue;
+
+    // Only a pointer to the start of an object can be freed. If the argument
+    // is the address of a field or array element inside another object
+    // (e.g. '&scan->st.rs_tbmiterator'), do not walk up to the base region:
+    // that would mark the whole enclosing object as freed.
+    R = R->StripCasts();
+    const SymbolicRegion *SR = dyn_cast<SymbolicRegion>(R);
+    if (!SR)
+      continue;
+    SymbolRef Sym = SR->getSymbol();
+
+    // look up the symbol reference in the RegionStatePG map. If found, handle
+    // double-free
+    if (const PGRefState *RS = State->get<RegionStatePG>(Sym)) {
+      // if both the old and the new functions are C functions ignore
+      // -> we don't want to get in the way of the MallocChecker
+      if (CMemoryMap.contains(RS->getFunction()->getName())
+        && CMemoryMap.contains(FD->getName()))
+        continue;
+      // determine the quality of the double-free
+      Category CatFirst = RS->isReleased() ? Strict : Arbitrary;
+      if (!IgnoreDouble.contains(FD->getNameAsString()) &&
+          !State->contains<ReportedPG>(Sym))
+        DoubleFrees.push_back({*RS, Sym, getNameFromExpression(ArgExpr),
+                               CatFirst});
+    }
+
+    // the variable name to be used in a potential warning
+    std::string VarName = getNameFromExpression(ArgExpr);
+
+    // depending on the category of the freeing function set a released or
+    // possibly released state
+    if (Cat == Strict)
+      State = State->set<RegionStatePG>(Sym, PGRefState::getReleased(
+                                                    ParentExpr, FD, VarName));
+    else if (Cat == Arbitrary)
+      State = State->set<RegionStatePG>(Sym, PGRefState::getPossiblyReleased(
+                                                    ParentExpr, FD, VarName));
+    else
+      continue; // Dependent was resolved above; we should never get here
+    Changed = true;
   }
 
-  // the variable name to be used in a potential warning
-  std::string VarName = getNameFromExpression(ArgExpr);
-
-  // depending on the category of the freeing function set a released or possibly 
-  // released state
-  switch (Cat){
-    case Strict:
-      State = State->set<RegionStatePG>(SymBase, PGRefState::getReleased(
-                                                        ParentExpr, FD, VarName));
-      break;
-    case Dependent:
-      return;// We should never get here (could this be handled better?)
-    case Arbitrary:
-      State = State->set<RegionStatePG>(SymBase, PGRefState::getPossiblyReleased(
-                                                        ParentExpr, FD, VarName));
-      break;
-    default:
+  // Report double frees from one error node, and continue the analysis from
+  // that node (instead of adding a second, unrelated successor node).
+  if (!DoubleFrees.empty()) {
+    for (const PendingDoubleFree &D : DoubleFrees)
+      State = State->add<ReportedPG>(D.Sym);
+    ExplodedNode *N = C.generateNonFatalErrorNode(State, this);
+    if (!N)
       return;
+    for (const PendingDoubleFree &D : DoubleFrees)
+      HandleDoubleFree(C, ParentExpr->getSourceRange(), &D.RS, D.Sym,
+                       D.VarName, D.FirstFreeCat, Cat, N);
+    return;
   }
 
   // add the state to the checker context
-  C.addTransition(State);
+  if (Changed)
+    C.addTransition(State);
 }
 
 // Check whether the location accessed is a freed symbolic region.
@@ -1028,43 +1090,73 @@ void PostgresChecker::checkPreStmt(const ReturnStmt *S, CheckerContext &C) const
     checkUseAfterFree(Sym, getNameFromExpression(E), C, E);
 }
 
+// Remove symbols that can no longer be referenced from the checker's state.
+// Without this, the state keeps growing along every path, which slows down
+// the analysis of large functions.
+void PostgresChecker::checkDeadSymbols(SymbolReaper &SymReaper,
+                                       CheckerContext &C) const {
+  ProgramStateRef State = C.getState();
+  bool Changed = false;
+
+  for (const auto &Entry : State->get<RegionStatePG>()) {
+    if (SymReaper.isDead(Entry.first)) {
+      State = State->remove<RegionStatePG>(Entry.first);
+      Changed = true;
+    }
+  }
+  for (SymbolRef Sym : State->get<ReportedPG>()) {
+    if (SymReaper.isDead(Sym)) {
+      State = State->remove<ReportedPG>(Sym);
+      Changed = true;
+    }
+  }
+
+  if (Changed)
+    C.addTransition(State);
+}
+
 // Check whether the memory region the symbolic reference is pointing to has been
-// freed -> look into the RegionStatePG map and handle strict and arbitrary cases
+// freed -> look into the RegionStatePG map and handle strict and arbitrary cases.
+// Only the first use after a free is reported on each path.
 bool PostgresChecker::checkUseAfterFree(SymbolRef Sym, std::string varName, 
                                         CheckerContext &C, const Stmt * S) const{
-  const PGRefState *RS = C.getState()->get<RegionStatePG>(Sym);
+  ProgramStateRef State = C.getState();
+  // already reported on this path
+  if (State->contains<ReportedPG>(Sym))
+    return false;
+  const PGRefState *RS = State->get<RegionStatePG>(Sym);
   // no use-after-free
   if (!RS)
     return false;
-  if (RS && RS->isReleased()) {
-    HandleUseAfterFree(C, S->getSourceRange(), RS, varName, Strict);
-    return true;
-  }
-  if (RS && RS->isPossiblyReleased()) {
-    HandleUseAfterFree(C, S->getSourceRange(), RS, varName, Arbitrary);
-    return true;
-  }
-  return false;
+  Category Cat;
+  if (RS->isReleased())
+    Cat = Strict;
+  else if (RS->isPossiblyReleased())
+    Cat = Arbitrary;
+  else
+    return false;
+
+  ExplodedNode *N = C.generateNonFatalErrorNode(State->add<ReportedPG>(Sym),
+                                                this);
+  if (!N)
+    return false;
+  HandleUseAfterFree(C, S->getSourceRange(), RS, Sym, varName, Cat, N);
+  return true;
 }
 
-// Emit a basic bug report with message
-void PostgresChecker::emitReport(const PGRefState *RS, BugType *BT, 
-                                 CheckerContext &C, std::string message) const{
-  if (!BT)
-    return;
-  // One could also argue, that we should use a fatal error node here for strict
-  // functions and a non-fatal one for arbitrary ones. Since MallocChecker uses
-  // non-fatal for 'strict' cases, we follow suite.
-  ExplodedNode *EN = C.generateNonFatalErrorNode(C.getState(), this);
-  if (!EN) 
+// Emit a path-sensitive bug report with message. Unlike a BasicBugReport, this
+// shows the path that led to the problem (with -analyzer-output=text, html,
+// sarif, ...), and lets the analyzer deduplicate reports.
+void PostgresChecker::emitReport(const PGRefState *RS, SymbolRef Sym,
+                                 BugType *BT, CheckerContext &C,
+                                 std::string message, ExplodedNode *N) const{
+  if (!BT || !N)
     return;
 
-  // get location information for the current site and create the report
-  PathDiagnosticLocation PDLoc = PathDiagnosticLocation::create(
-    EN->getLocation(),  
-    C.getSourceManager()
-  );
-  auto R = std::make_unique<BasicBugReport>(*BT, message,PDLoc);
+  auto R = std::make_unique<PathSensitiveBugReport>(*BT, message, N);
+  // highlight the freed symbol along the path
+  if (Sym)
+    R->markInteresting(Sym);
 
   // if, for some reason, the PGRefState is invalid, emit a report without 
   // information about the free site
@@ -1093,8 +1185,8 @@ void PostgresChecker::emitReport(const PGRefState *RS, BugType *BT,
     R->addNote(("The return value should probably be checked"), PDLocOriginal);
     // add a note about the free site to the report
   } else {
-    R->addNote("Freeing function" + (FD ? (": " + FD->getNameAsString() + addition) 
-                                   : "<unknown>"), PDLocOriginal);
+    R->addNote("Freeing function: " + FD->getNameAsString() + addition,
+               PDLocOriginal);
   }
 
   C.emitReport(std::move(R));
