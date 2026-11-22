@@ -148,6 +148,59 @@ public:
 
 };
 
+namespace {
+// Adds a step to the bug path at the point where the reported symbol was
+// (possibly) released. Without it, the free is only visible as an extra note,
+// and the analyzer prunes the call that contains the free from the path,
+// because nothing in it looks interesting.
+class PGBugVisitor final : public BugReporterVisitor {
+  SymbolRef Sym;
+
+public:
+  explicit PGBugVisitor(SymbolRef S) : Sym(S) {}
+
+  void Profile(llvm::FoldingSetNodeID &ID) const override {
+    static int Tag = 0;
+    ID.AddPointer(&Tag);
+    ID.AddPointer(Sym);
+  }
+
+  PathDiagnosticPieceRef VisitNode(const ExplodedNode *N,
+                                   BugReporterContext &BRC,
+                                   PathSensitiveBugReport &BR) override {
+    // The error node itself is reported by the bug report.
+    if (N == BR.getErrorNode())
+      return nullptr;
+    const ExplodedNode *Pred = N->getFirstPred();
+    if (!Pred)
+      return nullptr;
+
+    const PGRefState *RSCurr = N->getState()->get<RegionStatePG>(Sym);
+    if (!RSCurr)
+      return nullptr;
+    const PGRefState *RSPrev = Pred->getState()->get<RegionStatePG>(Sym);
+    // Only report the node where the state of the symbol changed.
+    if (RSPrev && *RSPrev == *RSCurr)
+      return nullptr;
+
+    const Stmt *S = RSCurr->getStmt();
+    const FunctionDecl *FD = RSCurr->getFunction();
+    if (!S || !FD)
+      return nullptr;
+
+    std::string Msg = RSCurr->isReleased() ? "Memory is released"
+                                           : "Memory is possibly released";
+    Msg += " by call to '" + FD->getNameAsString() + "'";
+
+    PathDiagnosticLocation Pos(S, BRC.getSourceManager(),
+                               N->getLocationContext());
+    if (!Pos.isValid())
+      return nullptr;
+    return std::make_shared<PathDiagnosticEventPiece>(Pos, Msg, true);
+  }
+};
+} // end of anonymous namespace
+
 // This map defines standard C memory management functions. We look out for them
 // to not get in the way of the MallocChecker.
 llvm::StringMap<int> CMemoryMap{
@@ -1154,9 +1207,11 @@ void PostgresChecker::emitReport(const PGRefState *RS, SymbolRef Sym,
     return;
 
   auto R = std::make_unique<PathSensitiveBugReport>(*BT, message, N);
-  // highlight the freed symbol along the path
-  if (Sym)
+  // highlight the freed symbol along the path, and show where it was freed
+  if (Sym) {
     R->markInteresting(Sym);
+    R->addVisitor<PGBugVisitor>(Sym);
+  }
 
   // if, for some reason, the PGRefState is invalid, emit a report without 
   // information about the free site
